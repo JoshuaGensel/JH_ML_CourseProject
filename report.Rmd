@@ -1,0 +1,157 @@
+---
+title: "ML course project"
+author: "Leon Joshua Gensel"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## Data Processing
+
+For this project I used the following packages:
+```{r, message=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(caret)
+library(factoextra)
+library(ggfortify)
+library(patchwork)
+```
+
+
+Firstly I accessed the data using the provided Links and loaded them in. 
+
+```{r, message=FALSE}
+if(!dir.exists("./data")){dir.create("./data")}
+if(!file.exists("./data/training.csv")&!exists("./data/testing.csv")){
+    url_training = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+    download.file(url_training, "./data/training.csv")
+    url_testing = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+    download.file(url_testing, "./data/testing.csv")
+}
+training_full <- read.csv("./data/training.csv")
+testing <- read.csv("./data/testing.csv")
+```
+
+Then I set the seed for reproducability and created a training and validation set from the provided training set.
+```{r}
+set.seed(12031998)
+inTrain <- createDataPartition(y=training_full$classe, p=.6, list = FALSE)
+training <- training_full[inTrain,]
+validation <- training_full[-inTrain,]
+```
+
+To get an idea of the data set I first looked at the classe variable, which we're trying to predict. I also checked for near zero variance variables, which there were quite some in the dataset. After looking for NAs I saw that there were only NAs in certain variables, but for those over 90% of observations were missing (I suspect a failure of the sensors used for certain measurements).
+```{r, results='hide'}
+unique(training$classe)
+nearZeroVar(training, saveMetrics = TRUE)
+sapply(training, function(x) sum(is.na(x))/nrow(training))
+sapply(training, function(x) (sum(is.na(x))/nrow(training)<0.1))
+sapply(training, class)
+```
+To preprocess the data set I aimed to filter the data set to only include variables that I want to use in my prediction model. Therefore I removed all variables that are not causally related to the outcome (like the time window metrics of the measurements), are near zero variance or consist of mostly NAs.
+```{r}
+training <- training %>%
+    select(-nearZeroVar(training,names = TRUE)) %>%
+    select(-c(cvtd_timestamp, X, raw_timestamp_part_1, raw_timestamp_part_2, num_window)) %>%
+    mutate(classe = as.factor(classe))
+training <- training[,sapply(training, function(x) (sum(is.na(x))/nrow(training)<0.1))]
+```
+
+## Exploratory data analysis
+
+To do some exploratory data analysis to detect potential patterns of the data I decided to do a PCA on the large amount of predictors I deemed important.
+```{r}
+training_pca <- prcomp(training[,2:52], scale. = TRUE)
+fviz_eig(training_pca)
+```
+
+```{r}
+p1 <- autoplot(training_pca, data = training, col = "classe")
+p2 <- autoplot(training_pca, data = training, col = "user_name")
+p1 + p2
+```
+
+Even though the first principle components do not account for most of the variability in the data set we can see some clear clusters plotting the first 2 PCs. Unfortunately the clusters seem to be defined by the individual and not the class, which would have made the prediction process much easier. This lead to me deciding not to use the PCA but the raw data to train my model. Also I concluded that non-linear functions will most likely perform better.
+
+## Building models
+
+Since we don't care about interpretability or scalability, but instead just want the most accurate result, and I suspect non-linear models to work better I decided to build a random forest model and a stochastic gradient boosting model. 
+
+As training control I used the typical 10-fold cross validation for both models.
+
+```{r}
+folds <- createFolds(training$classe, k = 10, returnTrain = TRUE)
+train_control <- trainControl(method = "cv",
+                     number = 10,
+                     search = 'grid',
+                     classProbs = TRUE,
+                     savePredictions = "final",
+                     index = folds)
+```
+
+### Random Dorest Model
+
+For the random forest I only tuned for mtry (the number of variables sampled at each split) with 50 trees. Using the train control previously defined 8 turned out to be the optimal tune for mtry. For the final model I used mtry = 8 and increased the number of trees, since I read [here](https://towardsdatascience.com/random-forest-hyperparameters-and-how-to-fine-tune-them-17aee785ee0d), that turning the number of trees up does not lead to overfitting. I used a forest of 200 trees, because that was the maximum number that still had a reasonable runtime on my local machine and there are deminishing returns for the number of trees anyway.
+
+```{r, cache=TRUE}
+tuneOpt = expand.grid(.mtry = c(8))
+rf_fit <- train(classe~.,
+                  data = training,
+                  method = "rf",
+                  importance=TRUE,
+                  tuneGrid = tuneOpt,
+                  trControl = train_control,
+                  ntree = 200)
+rf_fit$results
+```
+
+As we can see the model performed very well on the cross validation.
+
+### Stochastic Gradient Boosting
+
+For the GBM model I used the following tuning grid:
+```{r}
+gbmGrid <- expand.grid(interaction.depth = 1:5,
+                       n.trees = 100,
+                       shrinkage = .1,
+                       n.minobsinnode = c(10,20))
+```
+interaction.depth is the maximum tree depth, n.minobsinnode is the minimum terminal node size of the trees, n.trees is the number of boosting iterations (which I held constant because of the same reason for the random forest), and shrinkage is the learning rate (which I decided to hold constant because 0.1 is usually the highest value commonly used but decreasing it makes it necessary to use more iterations).
+
+The optimal tune turned out to be interaction.depth = 5 and n.minobsinnode = 10. This lead me to believe that an even higher tree depth might have performed even better in the cross validation, but it might also defeat the purpose of boosting using an ensemble of weak learners. That is why I decided to stick with interaction.depth = 5 for the final model.
+
+```{r, cache=TRUE}
+tuneOpt <- expand.grid(interaction.depth = 5,
+                       n.trees = 400,
+                       shrinkage = .1,
+                       n.minobsinnode = 20)
+gbm_fit <- train(classe ~ .,
+                   data = training,
+                   method = "gbm",
+                   tuneGrid = tuneOpt,
+                   verbose = FALSE,
+                   trControl = train_control)
+gbm_fit$results
+```
+
+In the results we see that the boosting algorithm performed also with an accuracy over 99%, but very slightly worse than the random forest.
+
+## Results
+
+After seeing the high accuracies on the cross validation I was afraid that the models might overfit the training data, but we will see on the validation set if that was actually the case.
+
+Here are the results of validation of the random forest:
+```{r}
+confusionMatrix(predict(rf_fit, validation), as.factor(validation$classe))
+```
+As we can see, the out of sample error is just very slightly lower and the model did not overfit.
+
+Here are the results of validation of the boosting model:
+
+```{r}
+confusionMatrix(predict(gbm_fit, validation), as.factor(validation$classe))
+```
+
+The results look similar to the random forest, just again very slightly lower, like on the cross validation.
+
+In conclusion I would say both models lead to highly accurate predictions. The random forest for me is the choice here, since it is slightly more accurate and runs a bit faster on my local machine.
